@@ -3,6 +3,7 @@ import csv
 import io
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pandas as pd
@@ -16,10 +17,12 @@ URL = "https://ejada.sa"
 DB = "ejada"
 MODEL = "crm.lead"
 PORTFOLIO_LABEL = "Portfolio Type"
+PORTFOLIO_FIELD = ""   # بعد أول تشغيل حط هنا الاسم التقني اللي هيظهر في السايدبار (بيسرّع التحميل)
 BASE_DOMAIN = [["deleted_user", "=", False]]      # استبعاد المحذوف
 BATCH = 50000                                      # لو السيرفر اتأخر نزّله لـ 20000
 TEST_LIMIT = 5000
 EXCEL_MAX = 1_048_575                              # حد صفوف الإكسيل (بدون الهيدر)
+CACHE_SECONDS = 3600                               # مدة تخزين قايمة الشركات والحقول
 HIDE_PREFIX = ("message_", "activity_", "website_message", "has_message", "__")
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NEWLINES = re.compile(r"\s*[\r\n]+\s*")
@@ -66,22 +69,21 @@ def path_label(path, labels):
     return first if len(parts) == 1 else first + "/" + "/".join(parts[1:])
 
 
-def load_everything(a):
-    meta = call(a, MODEL, "fields_get", [], {"attributes": ["string", "type"]})
+def load_templates(a):
+    templates = {}
+    try:
+        exports = call(a, "ir.exports", "search_read", [[["resource", "=", MODEL]]],
+                       {"fields": ["name", "export_fields"]})
+        for e in exports:
+            lines = call(a, "ir.exports.line", "read", [e["export_fields"]], {"fields": ["name"]}) \
+                if e["export_fields"] else []
+            templates[e["name"]] = [l["name"] for l in lines]
+    except Exception:
+        pass
+    return templates
 
-    portfolio = next((n for n, m in meta.items()
-                      if m.get("string", "").strip().lower() == PORTFOLIO_LABEL.lower()), None)
-    if not portfolio:
-        raise Exception(f"مش لاقي حقل '{PORTFOLIO_LABEL}'، كلّم المسؤول عن الأداة.")
 
-    labels = {n: m.get("string", n) for n, m in meta.items()}
-    fields = {n: labels[n] for n, m in meta.items()
-              if m.get("type") != "binary" and not n.startswith(HIDE_PREFIX)}
-    count = {}
-    for v in fields.values():
-        count[v] = count.get(v, 0) + 1
-    display = {n: (v if count[v] == 1 else f"{v}  [{n}]") for n, v in fields.items()}
-
+def load_groups(a, portfolio):
     groups = []
     raw = call(a, MODEL, "read_group", [BASE_DOMAIN, [portfolio], [portfolio]],
                {"lazy": False, "limit": 500})
@@ -94,21 +96,42 @@ def load_everything(a):
             key, name = val, (str(val) if val not in (False, None) else "بدون قيمة")
         groups.append({"key": key, "name": name, "count": cnt})
     groups.sort(key=lambda x: x["name"].lower())
+    return groups
 
-    templates = {}
-    try:
-        exports = call(a, "ir.exports", "search_read", [[["resource", "=", MODEL]]],
-                       {"fields": ["name", "export_fields"]})
-        for e in exports:
-            lines = call(a, "ir.exports.line", "read", [e["export_fields"]], {"fields": ["name"]}) \
-                if e["export_fields"] else []
-            templates[e["name"]] = [l["name"] for l in lines]
-    except Exception:
-        templates = {}
+
+def load_everything(a):
+    # الطلبات التلاتة بتشتغل مع بعض
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_meta = ex.submit(call, a, MODEL, "fields_get", [], {"attributes": ["string", "type"]})
+        f_tpl = ex.submit(load_templates, a)
+        f_groups = ex.submit(load_groups, a, PORTFOLIO_FIELD) if PORTFOLIO_FIELD else None
+
+        meta = f_meta.result()
+        portfolio = PORTFOLIO_FIELD or next(
+            (n for n, m in meta.items()
+             if m.get("string", "").strip().lower() == PORTFOLIO_LABEL.lower()), None)
+        if not portfolio:
+            raise Exception(f"مش لاقي حقل '{PORTFOLIO_LABEL}'، كلّم المسؤول عن الأداة.")
+        groups = f_groups.result() if f_groups else load_groups(a, portfolio)
+        templates = f_tpl.result()
+
+    labels = {n: m.get("string", n) for n, m in meta.items()}
+    fields = {n: labels[n] for n, m in meta.items()
+              if m.get("type") != "binary" and not n.startswith(HIDE_PREFIX)}
+    count = {}
+    for v in fields.values():
+        count[v] = count.get(v, 0) + 1
+    display = {n: (v if count[v] == 1 else f"{v}  [{n}]") for n, v in fields.items()}
 
     return dict(portfolio=portfolio, labels=labels, display=display, groups=groups,
                 templates=templates,
                 field_names=sorted(display, key=lambda n: display[n].lower()))
+
+
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
+def load_everything_cached(uid, _a):
+    # الـ uid هو مفتاح الـ cache، والـ _a (فيه الباسورد) مش بيتخزن ولا بيتعمله hash
+    return load_everything(_a)
 
 
 # ======================= السحب + الكتابة في الملف (دفعة بدفعة) =======================
@@ -163,14 +186,14 @@ def build_file(a, domain, paths, headers, limit, fmt, progress):
                     break
                 n += 1
                 for c, v in enumerate(row):
-                    if v is None or v == "":
+                    if v is None or v is False or v == "":
                         continue
                     if isinstance(v, str):
                         ws.write_string(n, c, v)
                     else:
                         ws.write(n, c, v)
         else:
-            writer.writerows(rows)
+            writer.writerows([["" if (v is False or v is None) else v for v in r] for r in rows])
             n += len(rows)
 
         if len(preview) < 200:
@@ -215,6 +238,12 @@ def logout():
         del st.session_state[k]
 
 
+def refresh_data():
+    load_everything_cached.clear()
+    for k in ("data", "result"):
+        st.session_state.pop(k, None)
+
+
 def apply_template():
     name = st.session_state.get("tpl")
     tpls = st.session_state["data"]["templates"]
@@ -252,12 +281,15 @@ def main_screen():
 
     with st.sidebar:
         st.markdown(f"👤 **{a['user']}**")
+        st.button("🔄 تحديث الأرقام والقوائم", on_click=refresh_data)
         st.button("تسجيل خروج", on_click=logout)
+        if "data" in st.session_state:
+            st.caption(f"حقل الشركة: {st.session_state['data']['portfolio']}")
 
     if "data" not in st.session_state:
         try:
             with st.spinner("لحظات... بنجهّز البيانات"):
-                st.session_state["data"] = load_everything(a)
+                st.session_state["data"] = load_everything_cached(a["uid"], a)
         except Exception as e:
             st.error(f"حصل خطأ أثناء التحميل: {e}")
             st.button("🔄 جرّب تاني", on_click=lambda: st.session_state.pop("data", None))
