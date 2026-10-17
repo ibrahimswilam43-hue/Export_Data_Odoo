@@ -2,6 +2,7 @@
 import csv
 import io
 import re
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -17,12 +18,12 @@ URL = "https://ejada.sa"
 DB = "ejada"
 MODEL = "crm.lead"
 PORTFOLIO_LABEL = "Portfolio Type"
-PORTFOLIO_FIELD = ""   # بعد أول تشغيل حط هنا الاسم التقني اللي هيظهر في السايدبار (بيسرّع التحميل)
+PORTFOLIO_FIELD = ""                               # اختياري: الاسم التقني لحقل الشركة لو عايز تحدده يدوي
 BASE_DOMAIN = [["deleted_user", "=", False]]      # استبعاد المحذوف
 BATCH = 50000                                      # لو السيرفر اتأخر نزّله لـ 20000
 TEST_LIMIT = 5000
 EXCEL_MAX = 1_048_575                              # حد صفوف الإكسيل (بدون الهيدر)
-CACHE_SECONDS = 3600                               # مدة تخزين قايمة الشركات والحقول
+CACHE_SECONDS = 6 * 3600                           # مدة تخزين قايمة الشركات والأعمدة
 HIDE_PREFIX = ("message_", "activity_", "website_message", "has_message", "__")
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NEWLINES = re.compile(r"\s*[\r\n]+\s*")
@@ -62,11 +63,33 @@ def call(a, model, method, args, kwargs=None):
     return rpc("object", "execute_kw", DB, a["uid"], a["pwd"], model, method, args, kwargs or {})
 
 
-# ======================= تحميل البيانات الأساسية =======================
+# ======================= تحميل خفيف: أسماء بس =======================
 def path_label(path, labels):
     parts = path.split("/")
     first = labels.get(parts[0], parts[0])
     return first if len(parts) == 1 else first + "/" + "/".join(parts[1:])
+
+
+def load_fields(a):
+    """أسماء الأعمدة: الأول من ir.model.fields (أسرع)، ولو مفيش صلاحية نرجع لـ fields_get"""
+    labels, types, relations = {}, {}, {}
+    try:
+        rows = call(a, "ir.model.fields", "search_read", [[["model", "=", MODEL]]],
+                    {"fields": ["name", "field_description", "ttype", "relation"]})
+        for r in rows:
+            labels[r["name"]] = r["field_description"] or r["name"]
+            types[r["name"]] = r["ttype"]
+            relations[r["name"]] = r.get("relation") or ""
+        if labels:
+            return labels, types, relations
+    except Exception:
+        pass
+    meta = call(a, MODEL, "fields_get", [], {"attributes": ["string", "type", "relation"]})
+    for n, m in meta.items():
+        labels[n] = m.get("string", n)
+        types[n] = m.get("type", "")
+        relations[n] = m.get("relation") or ""
+    return labels, types, relations
 
 
 def load_templates(a):
@@ -83,41 +106,50 @@ def load_templates(a):
     return templates
 
 
-def load_groups(a, portfolio):
-    groups = []
-    raw = call(a, MODEL, "read_group", [BASE_DOMAIN, [portfolio], [portfolio]],
-               {"lazy": False, "limit": 500})
+def load_companies(a, pf, types, relations):
+    """أسماء الشركات من غير عدّ. لو مقدرناش نجيبها بسرعة نرجع للتجميع (أبطأ)"""
+    t = types.get(pf)
+    try:
+        if t == "many2one" and relations.get(pf):
+            recs = call(a, relations[pf], "search_read", [[]], {"fields": ["display_name"], "limit": 501})
+            if len(recs) <= 500:
+                return sorted([{"key": r["id"], "name": r["display_name"]} for r in recs],
+                              key=lambda x: x["name"].lower())
+        elif t == "selection":
+            sel = call(a, MODEL, "fields_get", [[pf]], {"attributes": ["selection"]})[pf]["selection"]
+            return sorted([{"key": k, "name": v} for k, v in sel], key=lambda x: x["name"].lower())
+    except Exception:
+        pass
+
+    # الطريقة البطيئة (احتياطي)
+    raw = call(a, MODEL, "read_group", [BASE_DOMAIN, [pf], [pf]], {"lazy": False, "limit": 500})
+    out = []
     for g in raw:
-        val = g.get(portfolio)
-        cnt = g.get("__count", 0)
+        val = g.get(pf)
         if isinstance(val, (list, tuple)):
             key, name = val[0], val[1]
         else:
             key, name = val, (str(val) if val not in (False, None) else "بدون قيمة")
-        groups.append({"key": key, "name": name, "count": cnt})
-    groups.sort(key=lambda x: x["name"].lower())
-    return groups
+        out.append({"key": key, "name": name})
+    return sorted(out, key=lambda x: x["name"].lower())
 
 
-def load_everything(a):
-    # الطلبات التلاتة بتشتغل مع بعض
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_meta = ex.submit(call, a, MODEL, "fields_get", [], {"attributes": ["string", "type"]})
+def load_light(a):
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_fields = ex.submit(load_fields, a)
         f_tpl = ex.submit(load_templates, a)
-        f_groups = ex.submit(load_groups, a, PORTFOLIO_FIELD) if PORTFOLIO_FIELD else None
-
-        meta = f_meta.result()
-        portfolio = PORTFOLIO_FIELD or next(
-            (n for n, m in meta.items()
-             if m.get("string", "").strip().lower() == PORTFOLIO_LABEL.lower()), None)
-        if not portfolio:
-            raise Exception(f"مش لاقي حقل '{PORTFOLIO_LABEL}'، كلّم المسؤول عن الأداة.")
-        groups = f_groups.result() if f_groups else load_groups(a, portfolio)
+        labels, types, relations = f_fields.result()
         templates = f_tpl.result()
 
-    labels = {n: m.get("string", n) for n, m in meta.items()}
-    fields = {n: labels[n] for n, m in meta.items()
-              if m.get("type") != "binary" and not n.startswith(HIDE_PREFIX)}
+    portfolio = PORTFOLIO_FIELD or next(
+        (n for n, l in labels.items() if l.strip().lower() == PORTFOLIO_LABEL.lower()), None)
+    if not portfolio:
+        raise Exception(f"مش لاقي حقل '{PORTFOLIO_LABEL}'، كلّم المسؤول عن الأداة.")
+    groups = load_companies(a, portfolio, types, relations)
+
+    fields = {n: l for n, l in labels.items()
+              if types.get(n) != "binary" and not n.startswith(HIDE_PREFIX)}
     count = {}
     for v in fields.values():
         count[v] = count.get(v, 0) + 1
@@ -125,13 +157,19 @@ def load_everything(a):
 
     return dict(portfolio=portfolio, labels=labels, display=display, groups=groups,
                 templates=templates,
-                field_names=sorted(display, key=lambda n: display[n].lower()))
+                field_names=sorted(display, key=lambda n: display[n].lower()),
+                secs=round(time.perf_counter() - t0, 1))
 
 
 @st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
-def load_everything_cached(uid, _a):
+def load_light_cached(uid, _a):
     # الـ uid هو مفتاح الـ cache، والـ _a (فيه الباسورد) مش بيتخزن ولا بيتعمله hash
-    return load_everything(_a)
+    return load_light(_a)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def count_records(uid, portfolio, keys, _a):
+    return call(_a, MODEL, "search_count", [BASE_DOMAIN + [[portfolio, "in", list(keys)]]])
 
 
 # ======================= السحب + الكتابة في الملف (دفعة بدفعة) =======================
@@ -173,7 +211,6 @@ def build_file(a, domain, paths, headers, limit, fmt, progress):
 
         if is_xlsx:
             if start == 0:
-                # أول دفعة: نظبط العرض والتجميد والهيدر قبل كتابة الصفوف
                 sample = rows[:2000]
                 for i, h in enumerate(headers):
                     longest = max((len(str(r[i])) for r in sample), default=0)
@@ -239,7 +276,8 @@ def logout():
 
 
 def refresh_data():
-    load_everything_cached.clear()
+    load_light_cached.clear()
+    count_records.clear()
     for k in ("data", "result"):
         st.session_state.pop(k, None)
 
@@ -281,15 +319,16 @@ def main_screen():
 
     with st.sidebar:
         st.markdown(f"👤 **{a['user']}**")
-        st.button("🔄 تحديث الأرقام والقوائم", on_click=refresh_data)
+        st.button("🔄 تحديث القوائم", on_click=refresh_data)
         st.button("تسجيل خروج", on_click=logout)
         if "data" in st.session_state:
+            st.caption(f"زمن التحميل: {st.session_state['data']['secs']} ثانية")
             st.caption(f"حقل الشركة: {st.session_state['data']['portfolio']}")
 
     if "data" not in st.session_state:
         try:
-            with st.spinner("لحظات... بنجهّز البيانات"):
-                st.session_state["data"] = load_everything_cached(a["uid"], a)
+            with st.spinner("لحظات..."):
+                st.session_state["data"] = load_light_cached(a["uid"], a)
         except Exception as e:
             st.error(f"حصل خطأ أثناء التحميل: {e}")
             st.button("🔄 جرّب تاني", on_click=lambda: st.session_state.pop("data", None))
@@ -300,17 +339,23 @@ def main_screen():
     st.markdown("## 📥 سحب بيانات Claims")
 
     # ---------------- الخطوة 1 ----------------
+    total = 0
     with st.container(border=True):
         st.markdown("### 1️⃣ اختار الشركة")
         sel = st.multiselect(
             "الشركات", list(range(len(groups))),
-            format_func=lambda i: f"{groups[i]['name']}  ({groups[i]['count']:,})",
+            format_func=lambda i: groups[i]["name"],
             placeholder="اختار شركة أو أكتر...",
             label_visibility="collapsed",
         )
-        total = sum(groups[i]["count"] for i in sel)
         if sel:
-            st.caption(f"عدد السجلات: **{total:,}**")
+            keys = tuple(groups[i]["key"] for i in sel)
+            with st.spinner("بنعدّ السجلات..."):
+                try:
+                    total = count_records(a["uid"], d["portfolio"], keys, a)
+                    st.caption(f"عدد السجلات: **{total:,}**")
+                except Exception as e:
+                    st.caption(f"مقدرناش نعدّ السجلات: {e}")
 
     # ---------------- الخطوة 2 ----------------
     with st.container(border=True):
